@@ -52,6 +52,7 @@ type SearchProgress = {
 const MAX_CT_WINDOW_OFFSET = 1023;
 const SEARCH_BATCHES = 10;
 const CHUNK_SIZE = 64;
+const SEARCH_FETCH_CONCURRENCY = 3;
 
 const stringifyForUi = (value: unknown): string =>
   JSON.stringify(
@@ -509,11 +510,27 @@ export default function Home() {
       const foundDomains = new Set<string>();
       let checkedEntries = 0;
       let matchedEntries = 0;
+      let completedBatches = 0;
 
-      for (let batch = 0; batch < SEARCH_BATCHES; batch += 1) {
+      const batchSpecs = Array.from({ length: SEARCH_BATCHES }, (_, batch) => {
         const batchStart = baseStart + batch * (MAX_CT_WINDOW_OFFSET + 1);
-        const batchEnd = batchStart + MAX_CT_WINDOW_OFFSET;
-        const payload = await fetchCtEntriesRange(batchStart, batchEnd);
+        return {
+          batch,
+          batchStart,
+          batchEnd: batchStart + MAX_CT_WINDOW_OFFSET
+        };
+      });
+
+      const fetchedBatches = await processInChunks(batchSpecs, SEARCH_FETCH_CONCURRENCY, async (spec) => {
+        const payload = await fetchCtEntriesRange(spec.batchStart, spec.batchEnd);
+        return {
+          ...spec,
+          payload
+        };
+      });
+
+      for (const fetchedBatch of fetchedBatches) {
+        const { batchStart, payload } = fetchedBatch;
 
         await processInChunks(payload.entries, CHUNK_SIZE, async (entry, index) => {
           checkedEntries += 1;
@@ -552,8 +569,10 @@ export default function Home() {
           return null;
         });
 
+        completedBatches += 1;
+
         setSearchProgress({
-          completedBatches: batch + 1,
+          completedBatches,
           totalBatches: SEARCH_BATCHES,
           checkedEntries,
           matchedEntries
@@ -576,6 +595,9 @@ export default function Home() {
         <h1>CT Entry Decoder</h1>
         <p>
           Decode CT records, or run a fingerprint-based domain search over rolling windows from Nimbus 2026.
+        </p>
+        <p className="form-note" style={{ marginTop: "0.8rem" }}>
+          Organization-only view: <a href="/organization-only">/organization-only</a>
         </p>
       </section>
 

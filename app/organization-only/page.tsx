@@ -8,14 +8,18 @@ type ApiCtEntry = {
   extra_data: string;
 };
 
+type CtProvider = "cloudflare" | "digicert";
+
 type ApiResponse = {
   start: number;
   end: number;
+  provider?: CtProvider;
   count: number;
   entries: ApiCtEntry[];
 };
 
 type SearchProgress = {
+  provider: CtProvider;
   completedPages: number;
   totalPages: number;
   checkedEntries: number;
@@ -27,6 +31,7 @@ type SearchProgress = {
 type OrganizationRow = ParsedDomainRow & {
   logIndex: number;
   sourcePage: number;
+  source: CtProvider;
   timestampIso: string;
   entryTypeLabel: string;
   leafSubject: string;
@@ -53,6 +58,9 @@ const clampDigits = (value: string): string => value.replace(/[^\d]/g, "");
 const toErrorMessage = (value: unknown, fallback: string): string =>
   value instanceof Error ? value.message : fallback;
 
+const readProviderValue = (value: unknown, fallback: CtProvider): CtProvider =>
+  value === "cloudflare" || value === "digicert" ? value : fallback;
+
 const processInChunks = async <T, R>(
   items: T[],
   chunkSize: number,
@@ -69,10 +77,15 @@ const processInChunks = async <T, R>(
   return output;
 };
 
-const fetchCtEntriesRange = async (start: number, end: number): Promise<ApiResponse> => {
+const fetchCtEntriesRange = async (
+  start: number,
+  end: number,
+  provider: CtProvider
+): Promise<ApiResponse> => {
   const query = new URLSearchParams({
     start: String(start),
-    end: String(end)
+    end: String(end),
+    provider
   });
 
   const response = await fetch(`/api/ct-entries?${query.toString()}`);
@@ -95,6 +108,7 @@ const fetchCtEntriesRange = async (start: number, end: number): Promise<ApiRespo
   return {
     start: typeof payload.start === "number" ? payload.start : start,
     end: typeof payload.end === "number" ? payload.end : end,
+    provider: readProviderValue(payload.provider, provider),
     count: typeof payload.count === "number" ? payload.count : entries.length,
     entries
   };
@@ -152,6 +166,7 @@ function OrganizationRowsTable({ rows }: { rows: OrganizationRow[] }) {
           <tr>
             <th>log_index</th>
             <th>source_page</th>
+            <th>source</th>
             <th>timestamp_utc</th>
             <th>entry_type</th>
             <th>leaf_subject</th>
@@ -182,6 +197,7 @@ function OrganizationRowsTable({ rows }: { rows: OrganizationRow[] }) {
             >
               <td>{row.logIndex}</td>
               <td>{row.sourcePage}</td>
+              <td>{row.source}</td>
               <td>{row.timestampIso}</td>
               <td>{row.entryTypeLabel}</td>
               <td>{row.leafSubject}</td>
@@ -213,6 +229,7 @@ function OrganizationRowsTable({ rows }: { rows: OrganizationRow[] }) {
 
 export default function OrganizationOnlyPage() {
   const [start, setStart] = useState("325969000");
+  const [ctProvider, setCtProvider] = useState<CtProvider>("cloudflare");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<SearchProgress | null>(null);
@@ -234,6 +251,7 @@ export default function OrganizationOnlyPage() {
     }
 
     setProgress({
+      provider: ctProvider,
       completedPages: 0,
       totalPages: PAGE_COUNT,
       checkedEntries: 0,
@@ -262,7 +280,7 @@ export default function OrganizationOnlyPage() {
       });
 
       const fetchedPages = await processInChunks(pageSpecs, PAGE_FETCH_CONCURRENCY, async (spec) => {
-        const payload = await fetchCtEntriesRange(spec.batchStart, spec.batchEnd);
+        const payload = await fetchCtEntriesRange(spec.batchStart, spec.batchEnd, ctProvider);
         return {
           ...spec,
           payload
@@ -286,6 +304,7 @@ export default function OrganizationOnlyPage() {
                 ...row,
                 logIndex,
                 sourcePage: page + 1,
+                source: payload.provider ?? ctProvider,
                 timestampIso: parsed.timestampIso,
                 entryTypeLabel: parsed.entryTypeLabel,
                 leafSubject: parsed.leafSubject,
@@ -309,6 +328,7 @@ export default function OrganizationOnlyPage() {
         completedPages += 1;
 
         setProgress({
+          provider: ctProvider,
           completedPages,
           totalPages: PAGE_COUNT,
           checkedEntries,
@@ -321,6 +341,7 @@ export default function OrganizationOnlyPage() {
       insertedRows = await storeOrganizationRows(allRowsToStore);
       setRowsByOrganization(nextRowsByOrganization);
       setProgress({
+        provider: ctProvider,
         completedPages: PAGE_COUNT,
         totalPages: PAGE_COUNT,
         checkedEntries,
@@ -358,6 +379,17 @@ export default function OrganizationOnlyPage() {
               onChange={(event) => setStart(clampDigits(event.target.value))}
               placeholder="325969000"
             />
+          </div>
+          <div>
+            <label htmlFor="organization-provider">CT Provider</label>
+            <select
+              id="organization-provider"
+              value={ctProvider}
+              onChange={(event) => setCtProvider(event.target.value as CtProvider)}
+            >
+              <option value="cloudflare">Cloudflare</option>
+              <option value="digicert">DigiCert</option>
+            </select>
           </div>
         </div>
         <p className="form-note">
@@ -400,6 +432,10 @@ export default function OrganizationOnlyPage() {
               <p>
                 {progress.completedPages} / {progress.totalPages}
               </p>
+            </div>
+            <div>
+              <label>Provider</label>
+              <p>{progress.provider === "digicert" ? "DigiCert" : "Cloudflare"}</p>
             </div>
             <div>
               <label>Entries Checked</label>

@@ -60,6 +60,32 @@ export const executeClickHouseCommand = async (query: string): Promise<void> => 
   await runClickHouseRequest({ query });
 };
 
+export const executeClickHouseQuery = async (query: string): Promise<string> => {
+  return runClickHouseRequest({ query });
+};
+
+export const queryClickHouseJson = async <T>(query: string): Promise<T[]> => {
+  const normalizedQuery = query.trim();
+  const queryWithFormat = /\bFORMAT\s+JSON\b/i.test(normalizedQuery)
+    ? normalizedQuery
+    : `${normalizedQuery} FORMAT JSON`;
+
+  const responseText = await runClickHouseRequest({ query: queryWithFormat });
+
+  let payload: { data?: T[] };
+  try {
+    payload = JSON.parse(responseText) as { data?: T[] };
+  } catch {
+    throw new Error("ClickHouse returned non-JSON data for a JSON query.");
+  }
+
+  if (!Array.isArray(payload.data)) {
+    throw new Error("ClickHouse JSON response did not include a data array.");
+  }
+
+  return payload.data;
+};
+
 export const insertJsonEachRow = async (tableName: string, rows: Record<string, unknown>[]): Promise<void> => {
   if (rows.length === 0) {
     return;

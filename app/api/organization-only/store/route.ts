@@ -9,6 +9,7 @@ type StoreableOrganizationRow = {
   organization: string;
   log_index: number;
   source_page: number;
+  source: string;
   timestamp_utc: string;
   entry_type: string;
   leaf_subject: string;
@@ -32,7 +33,14 @@ type StoreableOrganizationRow = {
 };
 
 const TABLE_NAME = "organization_only_records";
+const ROOT_DOMAINS_AGG_TABLE = "root_domains_agg";
+const ROOT_DOMAIN_SUBDOMAINS_AGG_TABLE = "root_domain_subdomains_agg";
+const ROOT_DOMAINS_AGG_MV = "root_domains_agg_mv";
+const ROOT_DOMAIN_SUBDOMAINS_AGG_MV = "root_domain_subdomains_agg_mv";
+const ROOT_DOMAINS_VIEW = "root_domains";
+const ROOT_DOMAIN_SUBDOMAINS_VIEW = "root_domain_subdomains";
 let ensureTablePromise: Promise<void> | null = null;
+const SOURCE_VALUES = new Set(["cloudflare", "digicert"]);
 
 const toStringValue = (value: unknown): string => (typeof value === "string" ? value : "");
 
@@ -46,6 +54,11 @@ const toUInt = (value: unknown): number => {
   return Math.trunc(parsed);
 };
 
+const normalizeSource = (value: unknown): string => {
+  const normalized = toStringValue(value).trim().toLowerCase();
+  return SOURCE_VALUES.has(normalized) ? normalized : "";
+};
+
 const normalizeRow = (value: unknown): StoreableOrganizationRow | null => {
   if (typeof value !== "object" || value === null) {
     return null;
@@ -54,14 +67,11 @@ const normalizeRow = (value: unknown): StoreableOrganizationRow | null => {
   const row = value as Record<string, unknown>;
   const organization = toStringValue(row.organization).trim();
 
-  if (organization.length === 0) {
-    return null;
-  }
-
   return {
     organization,
     log_index: toUInt(row.logIndex),
     source_page: toUInt(row.sourcePage),
+    source: normalizeSource(row.source),
     timestamp_utc: toStringValue(row.timestampIso),
     entry_type: toStringValue(row.entryTypeLabel),
     leaf_subject: toStringValue(row.leafSubject),
@@ -95,6 +105,7 @@ const ensureOrganizationOnlyTable = async (): Promise<void> => {
           organization String,
           log_index UInt64,
           source_page UInt16,
+          source String,
           timestamp_utc String,
           entry_type String,
           leaf_subject String,
@@ -120,6 +131,108 @@ const ensureOrganizationOnlyTable = async (): Promise<void> => {
         ENGINE = MergeTree
         PRIMARY KEY organization
         ORDER BY (organization, log_index, domain_full, serial_number, ip_address)
+      `);
+      await executeClickHouseCommand(`
+        ALTER TABLE ${TABLE_NAME}
+        ADD COLUMN IF NOT EXISTS source String AFTER source_page
+      `);
+      await executeClickHouseCommand(`
+        CREATE TABLE IF NOT EXISTS ${ROOT_DOMAINS_AGG_TABLE}
+        (
+          root_domain LowCardinality(String),
+          source LowCardinality(String),
+          first_seen_state AggregateFunction(min, DateTime),
+          last_seen_state AggregateFunction(max, DateTime),
+          total_events_state AggregateFunction(sum, UInt64),
+          unique_subdomains_state AggregateFunction(uniqCombined64, String)
+        )
+        ENGINE = AggregatingMergeTree
+        ORDER BY (root_domain, source)
+      `);
+      await executeClickHouseCommand(`
+        CREATE TABLE IF NOT EXISTS ${ROOT_DOMAIN_SUBDOMAINS_AGG_TABLE}
+        (
+          root_domain LowCardinality(String),
+          subdomain String,
+          source LowCardinality(String),
+          first_seen_state AggregateFunction(min, DateTime),
+          last_seen_state AggregateFunction(max, DateTime),
+          seen_count_state AggregateFunction(sum, UInt64)
+        )
+        ENGINE = AggregatingMergeTree
+        ORDER BY (root_domain, subdomain, source)
+      `);
+      await executeClickHouseCommand(`
+        CREATE MATERIALIZED VIEW IF NOT EXISTS ${ROOT_DOMAINS_AGG_MV}
+        TO ${ROOT_DOMAINS_AGG_TABLE}
+        AS
+        SELECT
+          root_domain,
+          if(source = '', 'unknown', source) AS source,
+          minState(event_time) AS first_seen_state,
+          maxState(event_time) AS last_seen_state,
+          sumState(toUInt64(1)) AS total_events_state,
+          uniqCombined64State(subdomain) AS unique_subdomains_state
+        FROM
+        (
+          SELECT
+            root_domain,
+            subdomain,
+            source,
+            ifNull(parseDateTimeBestEffortOrNull(timestamp_utc), inserted_at) AS event_time
+          FROM ${TABLE_NAME}
+        )
+        WHERE root_domain != ''
+        GROUP BY root_domain, source
+      `);
+      await executeClickHouseCommand(`
+        CREATE MATERIALIZED VIEW IF NOT EXISTS ${ROOT_DOMAIN_SUBDOMAINS_AGG_MV}
+        TO ${ROOT_DOMAIN_SUBDOMAINS_AGG_TABLE}
+        AS
+        SELECT
+          root_domain,
+          if(subdomain = '', '@apex', subdomain) AS subdomain,
+          if(source = '', 'unknown', source) AS source,
+          minState(event_time) AS first_seen_state,
+          maxState(event_time) AS last_seen_state,
+          sumState(toUInt64(1)) AS seen_count_state
+        FROM
+        (
+          SELECT
+            root_domain,
+            subdomain,
+            source,
+            ifNull(parseDateTimeBestEffortOrNull(timestamp_utc), inserted_at) AS event_time
+          FROM ${TABLE_NAME}
+        )
+        WHERE root_domain != ''
+        GROUP BY root_domain, subdomain, source
+      `);
+      await executeClickHouseCommand(`
+        CREATE VIEW IF NOT EXISTS ${ROOT_DOMAINS_VIEW}
+        AS
+        SELECT
+          root_domain,
+          source,
+          minMerge(first_seen_state) AS first_seen,
+          maxMerge(last_seen_state) AS last_seen,
+          sumMerge(total_events_state) AS total_events,
+          uniqCombined64Merge(unique_subdomains_state) AS unique_subdomains
+        FROM ${ROOT_DOMAINS_AGG_TABLE}
+        GROUP BY root_domain, source
+      `);
+      await executeClickHouseCommand(`
+        CREATE VIEW IF NOT EXISTS ${ROOT_DOMAIN_SUBDOMAINS_VIEW}
+        AS
+        SELECT
+          root_domain,
+          subdomain,
+          source,
+          minMerge(first_seen_state) AS first_seen,
+          maxMerge(last_seen_state) AS last_seen,
+          sumMerge(seen_count_state) AS seen_count
+        FROM ${ROOT_DOMAIN_SUBDOMAINS_AGG_TABLE}
+        GROUP BY root_domain, subdomain, source
       `);
     })().catch((error) => {
       ensureTablePromise = null;

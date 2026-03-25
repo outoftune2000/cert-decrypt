@@ -9,7 +9,23 @@ type CtApiResponse = {
   entries: CtApiEntry[];
 };
 
-const CT_ENDPOINT = "https://ct.cloudflare.com/logs/nimbus2026/ct/v1/get-entries";
+type CtProvider = "cloudflare" | "digicert";
+
+type ProviderConfig = {
+  endpoint: string;
+  label: string;
+};
+
+const CT_PROVIDER_CONFIG: Record<CtProvider, ProviderConfig> = {
+  cloudflare: {
+    endpoint: "https://ct.cloudflare.com/logs/nimbus2026/ct/v1/get-entries",
+    label: "Cloudflare"
+  },
+  digicert: {
+    endpoint: "https://wyvern.ct.digicert.com/2026h1/ct/v1/get-entries",
+    label: "DigiCert"
+  }
+};
 const MAX_CT_WINDOW_OFFSET = 1023;
 
 const readUintParam = (value: string | null, label: string): number => {
@@ -30,13 +46,28 @@ const readUintParam = (value: string | null, label: string): number => {
   return parsed;
 };
 
+const readProviderParam = (value: string | null): CtProvider => {
+  if (value === null || value.trim().length === 0) {
+    return "cloudflare";
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "cloudflare" || normalized === "digicert") {
+    return normalized;
+  }
+
+  throw new Error("provider must be either cloudflare or digicert.");
+};
+
 export async function GET(request: NextRequest) {
   let start: number;
   let end: number;
+  let provider: CtProvider;
 
   try {
     start = readUintParam(request.nextUrl.searchParams.get("start"), "start");
     end = readUintParam(request.nextUrl.searchParams.get("end"), "end");
+    provider = readProviderParam(request.nextUrl.searchParams.get("provider"));
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : "Invalid query parameters." },
@@ -57,7 +88,8 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  const target = new URL(CT_ENDPOINT);
+  const providerConfig = CT_PROVIDER_CONFIG[provider];
+  const target = new URL(providerConfig.endpoint);
   target.searchParams.set("start", String(start));
   target.searchParams.set("end", String(end));
 
@@ -74,7 +106,7 @@ export async function GET(request: NextRequest) {
       const details = await response.text();
       return NextResponse.json(
         {
-          error: `Cloudflare CT endpoint returned ${response.status}.`,
+          error: `${providerConfig.label} CT endpoint returned ${response.status}.`,
           details: details.slice(0, 500)
         },
         { status: response.status }
@@ -86,7 +118,7 @@ export async function GET(request: NextRequest) {
     if (!Array.isArray(payload.entries)) {
       return NextResponse.json(
         {
-          error: "Cloudflare CT response did not include a valid entries array."
+          error: `${providerConfig.label} CT response did not include a valid entries array.`
         },
         { status: 502 }
       );
@@ -105,10 +137,11 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({
       start,
       end,
+      provider,
       count: entries.length,
       entries
     });
   } catch {
-    return NextResponse.json({ error: "Failed to reach Cloudflare CT endpoint." }, { status: 502 });
+    return NextResponse.json({ error: `Failed to reach ${providerConfig.label} CT endpoint.` }, { status: 502 });
   }
 }

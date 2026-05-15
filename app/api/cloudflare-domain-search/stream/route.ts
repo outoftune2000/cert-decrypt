@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { X509Certificate } from "crypto";
+import { resolveAllLogs, resolveLogBySlug } from "@/lib/ctLogList";
 
 type CtEntry = {
   leaf_input: string;
@@ -54,8 +55,6 @@ type BatchTelemetry = {
   decodeErrors: number;
 };
 
-const CLOUDFLARE_GET_ENTRIES = "https://ct.cloudflare.com/logs/nimbus2026/ct/v1/get-entries";
-const CLOUDFLARE_GET_STH = "https://ct.cloudflare.com/logs/nimbus2026/ct/v1/get-sth";
 const WINDOW_SIZE = 1024;
 const DEFAULT_BATCHES = 100;
 const FETCH_CONCURRENCY = 10;
@@ -254,10 +253,10 @@ const formatDateTimeUtc = (date: Date): string => {
   return `${iso.slice(0, 10)} ${iso.slice(11, 19)}`;
 };
 
-const fetchLatestIndex = async (): Promise<{ treeSize: number; latestIndex: number; timestamp: number; sthMs: number }> => {
+const fetchLatestIndex = async (sthEndpoint: string): Promise<{ treeSize: number; latestIndex: number; timestamp: number; sthMs: number }> => {
   const started = Date.now();
 
-  const response = await fetch(CLOUDFLARE_GET_STH, {
+  const response = await fetch(sthEndpoint, {
     headers: {
       "User-Agent": "yaak",
       Accept: "*/*"
@@ -287,9 +286,9 @@ const fetchLatestIndex = async (): Promise<{ treeSize: number; latestIndex: numb
   };
 };
 
-const fetchEntriesBatch = async (spec: BatchSpec): Promise<BatchFetchResult> => {
+const fetchEntriesBatch = async (spec: BatchSpec, entriesEndpoint: string): Promise<BatchFetchResult> => {
   const fetchStarted = Date.now();
-  const target = new URL(CLOUDFLARE_GET_ENTRIES);
+  const target = new URL(entriesEndpoint);
   target.searchParams.set("start", String(spec.start));
   target.searchParams.set("end", String(spec.end));
 
@@ -337,6 +336,7 @@ const writeEvent = <T>(
 
 export async function GET(request: NextRequest) {
   const rawDomain = request.nextUrl.searchParams.get("domain") ?? "";
+  const rawLogSlug = request.nextUrl.searchParams.get("logSlug");
 
   let requestedDomain: string;
   let maxBatches: number;
@@ -355,6 +355,39 @@ export async function GET(request: NextRequest) {
     );
   }
 
+  let getSthEndpoint: string;
+  let getEntriesEndpoint: string;
+  let resolvedSlug: string;
+
+  try {
+    if (rawLogSlug && rawLogSlug.trim().length > 0) {
+      const log = await resolveLogBySlug(rawLogSlug.trim().toLowerCase());
+      if (!log) {
+        return NextResponse.json(
+          { error: `Unknown CT log slug: "${rawLogSlug}". Call /api/ct-log-list for available slugs.` },
+          { status: 400 }
+        );
+      }
+      getSthEndpoint = log.getSthEndpoint;
+      getEntriesEndpoint = log.getEntriesEndpoint;
+      resolvedSlug = log.slug;
+    } else {
+      const logs = await resolveAllLogs();
+      const cfLog = logs.find((l) => l.operator.toLowerCase().includes("cloudflare"));
+      if (!cfLog) {
+        throw new Error("No usable Cloudflare CT log found for the current date.");
+      }
+      getSthEndpoint = cfLog.getSthEndpoint;
+      getEntriesEndpoint = cfLog.getEntriesEndpoint;
+      resolvedSlug = cfLog.slug;
+    }
+  } catch (error) {
+    return NextResponse.json(
+      { error: "Failed to resolve CT log endpoints.", details: error instanceof Error ? error.message : "Unknown error." },
+      { status: 502 }
+    );
+  }
+
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     start: async (controller) => {
@@ -368,7 +401,7 @@ export async function GET(request: NextRequest) {
           windowSize: WINDOW_SIZE
         });
 
-        const sth = await fetchLatestIndex();
+        const sth = await fetchLatestIndex(getSthEndpoint);
         const batchSpecs = buildBatchSpecs(sth.latestIndex, maxBatches);
 
         writeEvent(controller, encoder, "sth", {
@@ -391,7 +424,7 @@ export async function GET(request: NextRequest) {
 
         for (let offset = 0; offset < batchSpecs.length; offset += FETCH_CONCURRENCY) {
           const wave = batchSpecs.slice(offset, offset + FETCH_CONCURRENCY);
-          const fetchedWave = await Promise.all(wave.map((spec) => fetchEntriesBatch(spec)));
+          const fetchedWave = await Promise.all(wave.map((spec) => fetchEntriesBatch(spec, getEntriesEndpoint)));
 
           searchedBatches += wave.length;
 
@@ -493,7 +526,7 @@ export async function GET(request: NextRequest) {
 
         writeEvent(controller, encoder, "completed", {
           requestedDomain,
-          provider: "cloudflare",
+          provider: resolvedSlug,
           latestTreeSize: sth.treeSize,
           latestIndex: sth.latestIndex,
           sthTimestamp: new Date(sth.timestamp).toISOString(),

@@ -1,12 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createHash, X509Certificate } from "crypto";
-
-type CtProvider = "cloudflare" | "digicert";
-
-type ProviderConfig = {
-  endpoint: string;
-  label: string;
-};
+import { resolveAllLogs, resolveLogBySlug, type CtLogEntry } from "@/lib/ctLogList";
 
 type CtApiEntry = {
   leaf_input: string;
@@ -26,7 +20,7 @@ type ParsedChainCert = {
 
 type ParsedEntry = {
   index: number;
-  provider: CtProvider;
+  provider: string;
   providerLabel: string;
   entryType: number;
   entryTypeLabel: string;
@@ -54,17 +48,6 @@ type ParsedEntry = {
   chainRootSubject: string;
   chainRootFingerprintSha256: string;
   chainCertificates: ParsedChainCert[];
-};
-
-const CT_PROVIDER_CONFIG: Record<CtProvider, ProviderConfig> = {
-  cloudflare: {
-    endpoint: "https://ct.cloudflare.com/logs/nimbus2026/ct/v1/get-entries",
-    label: "Cloudflare"
-  },
-  digicert: {
-    endpoint: "https://wyvern.ct.digicert.com/2026h1/ct/v1/get-entries",
-    label: "DigiCert"
-  }
 };
 
 const MULTI_LABEL_TLDS = new Set([
@@ -103,17 +86,11 @@ const readUintParam = (value: string | null, label: string): number => {
   return parsed;
 };
 
-const readProviderParam = (value: string | null): CtProvider => {
+const readSlugParam = (value: string | null): string | null => {
   if (!value || value.trim().length === 0) {
-    return "cloudflare";
+    return null;
   }
-
-  const normalized = value.trim().toLowerCase();
-  if (normalized === "cloudflare" || normalized === "digicert") {
-    return normalized;
-  }
-
-  throw new Error("provider must be either cloudflare or digicert.");
+  return value.trim().toLowerCase();
 };
 
 const sanitizeBase64 = (value: string): string => {
@@ -267,9 +244,8 @@ const extractLeafCertDer = (entryType: number, leafBytes: Buffer, extraBytes: Bu
   throw new Error(`Unsupported entry type: ${entryType}.`);
 };
 
-const fetchRawCtEntry = async (index: number, provider: CtProvider): Promise<CtApiEntry> => {
-  const config = CT_PROVIDER_CONFIG[provider];
-  const target = new URL(config.endpoint);
+const fetchRawCtEntry = async (index: number, config: CtLogEntry): Promise<CtApiEntry> => {
+  const target = new URL(config.getEntriesEndpoint);
   target.searchParams.set("start", String(index));
   target.searchParams.set("end", String(index));
 
@@ -283,22 +259,21 @@ const fetchRawCtEntry = async (index: number, provider: CtProvider): Promise<CtA
 
   if (!response.ok) {
     const details = (await response.text()).slice(0, 500);
-    throw new Error(`${config.label} CT endpoint returned ${response.status}: ${details}`);
+    throw new Error(`${config.operator} CT endpoint returned ${response.status}: ${details}`);
   }
 
   const payload = (await response.json()) as CtApiResponse;
   const entry = payload.entries?.[0];
 
   if (!entry || typeof entry.leaf_input !== "string" || typeof entry.extra_data !== "string") {
-    throw new Error(`${config.label} CT response did not include a valid entry at index ${index}.`);
+    throw new Error(`${config.operator} CT response did not include a valid entry at index ${index}.`);
   }
 
   return entry;
 };
 
-const parseEntry = async (index: number, provider: CtProvider): Promise<ParsedEntry> => {
-  const providerConfig = CT_PROVIDER_CONFIG[provider];
-  const rawEntry = await fetchRawCtEntry(index, provider);
+const parseEntry = async (index: number, logEntry: CtLogEntry): Promise<ParsedEntry> => {
+  const rawEntry = await fetchRawCtEntry(index, logEntry);
   const leafBytes = decodeBase64(rawEntry.leaf_input);
   const extraBytes = decodeBase64(rawEntry.extra_data);
 
@@ -324,8 +299,8 @@ const parseEntry = async (index: number, provider: CtProvider): Promise<ParsedEn
 
   return {
     index,
-    provider,
-    providerLabel: providerConfig.label,
+    provider: logEntry.slug,
+    providerLabel: logEntry.operator,
     entryType,
     entryTypeLabel,
     ctTimestampIso: computeTimestampIso(leafBytes),
@@ -490,12 +465,12 @@ const buildAssessment = (left: ParsedEntry, right: ParsedEntry): Assessment => {
 export async function GET(request: NextRequest) {
   let indexA: number;
   let indexB: number;
-  let provider: CtProvider;
+  let slugParam: string | null;
 
   try {
     indexA = readUintParam(request.nextUrl.searchParams.get("indexA"), "indexA");
     indexB = readUintParam(request.nextUrl.searchParams.get("indexB"), "indexB");
-    provider = readProviderParam(request.nextUrl.searchParams.get("provider"));
+    slugParam = readSlugParam(request.nextUrl.searchParams.get("provider"));
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : "Invalid query parameters." },
@@ -503,8 +478,31 @@ export async function GET(request: NextRequest) {
     );
   }
 
+  let logEntry: CtLogEntry;
+
   try {
-    const [entryA, entryB] = await Promise.all([parseEntry(indexA, provider), parseEntry(indexB, provider)]);
+    if (slugParam === null) {
+      const logs = await resolveAllLogs();
+      logEntry = logs[0];
+    } else {
+      const resolved = await resolveLogBySlug(slugParam);
+      if (!resolved) {
+        return NextResponse.json(
+          { error: `Unknown CT log slug: "${slugParam}". Call /api/ct-log-list for available slugs.` },
+          { status: 400 }
+        );
+      }
+      logEntry = resolved;
+    }
+  } catch (error) {
+    return NextResponse.json(
+      { error: "Failed to resolve CT log endpoints.", details: error instanceof Error ? error.message : "Unknown error." },
+      { status: 502 }
+    );
+  }
+
+  try {
+    const [entryA, entryB] = await Promise.all([parseEntry(indexA, logEntry), parseEntry(indexB, logEntry)]);
     const assessment = buildAssessment(entryA, entryB);
 
     const comparison = {
@@ -527,10 +525,13 @@ export async function GET(request: NextRequest) {
     };
 
     return NextResponse.json({
-      provider,
-      providerLabel: CT_PROVIDER_CONFIG[provider].label,
+      provider: logEntry.slug,
+      providerLabel: logEntry.operator,
       indexA,
       indexB,
+      entryA,
+      entryB,
+      comparison,
       entryA,
       entryB,
       comparison,

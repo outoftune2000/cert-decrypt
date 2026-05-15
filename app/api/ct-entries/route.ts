@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { resolveAllLogs, resolveLogBySlug } from "@/lib/ctLogList";
 
 type CtApiEntry = {
   leaf_input: string;
@@ -9,23 +10,6 @@ type CtApiResponse = {
   entries: CtApiEntry[];
 };
 
-type CtProvider = "cloudflare" | "digicert";
-
-type ProviderConfig = {
-  endpoint: string;
-  label: string;
-};
-
-const CT_PROVIDER_CONFIG: Record<CtProvider, ProviderConfig> = {
-  cloudflare: {
-    endpoint: "https://ct.cloudflare.com/logs/nimbus2026/ct/v1/get-entries",
-    label: "Cloudflare"
-  },
-  digicert: {
-    endpoint: "https://wyvern.ct.digicert.com/2026h1/ct/v1/get-entries",
-    label: "DigiCert"
-  }
-};
 const MAX_CT_WINDOW_OFFSET = 1023;
 
 const readUintParam = (value: string | null, label: string): number => {
@@ -46,28 +30,22 @@ const readUintParam = (value: string | null, label: string): number => {
   return parsed;
 };
 
-const readProviderParam = (value: string | null): CtProvider => {
+const readSlugParam = (value: string | null): string | null => {
   if (value === null || value.trim().length === 0) {
-    return "cloudflare";
+    return null;
   }
-
-  const normalized = value.trim().toLowerCase();
-  if (normalized === "cloudflare" || normalized === "digicert") {
-    return normalized;
-  }
-
-  throw new Error("provider must be either cloudflare or digicert.");
+  return value.trim().toLowerCase();
 };
 
 export async function GET(request: NextRequest) {
   let start: number;
   let end: number;
-  let provider: CtProvider;
+  let slugParam: string | null;
 
   try {
     start = readUintParam(request.nextUrl.searchParams.get("start"), "start");
     end = readUintParam(request.nextUrl.searchParams.get("end"), "end");
-    provider = readProviderParam(request.nextUrl.searchParams.get("provider"));
+    slugParam = readSlugParam(request.nextUrl.searchParams.get("provider"));
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : "Invalid query parameters." },
@@ -88,8 +66,37 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  const providerConfig = CT_PROVIDER_CONFIG[provider];
-  const target = new URL(providerConfig.endpoint);
+  let getEntriesEndpoint: string;
+  let providerLabel: string;
+  let resolvedSlug: string;
+
+  try {
+    if (slugParam === null) {
+      const logs = await resolveAllLogs();
+      const log = logs[0];
+      getEntriesEndpoint = log.getEntriesEndpoint;
+      providerLabel = log.operator;
+      resolvedSlug = log.slug;
+    } else {
+      const log = await resolveLogBySlug(slugParam);
+      if (!log) {
+        return NextResponse.json(
+          { error: `Unknown CT log slug: "${slugParam}". Call /api/ct-log-list for available slugs.` },
+          { status: 400 }
+        );
+      }
+      getEntriesEndpoint = log.getEntriesEndpoint;
+      providerLabel = log.operator;
+      resolvedSlug = log.slug;
+    }
+  } catch (error) {
+    return NextResponse.json(
+      { error: "Failed to resolve CT log endpoints.", details: error instanceof Error ? error.message : "Unknown error." },
+      { status: 502 }
+    );
+  }
+
+  const target = new URL(getEntriesEndpoint);
   target.searchParams.set("start", String(start));
   target.searchParams.set("end", String(end));
 
@@ -106,7 +113,7 @@ export async function GET(request: NextRequest) {
       const details = await response.text();
       return NextResponse.json(
         {
-          error: `${providerConfig.label} CT endpoint returned ${response.status}.`,
+          error: `${providerLabel} CT endpoint returned ${response.status}.`,
           details: details.slice(0, 500)
         },
         { status: response.status }
@@ -117,9 +124,7 @@ export async function GET(request: NextRequest) {
 
     if (!Array.isArray(payload.entries)) {
       return NextResponse.json(
-        {
-          error: `${providerConfig.label} CT response did not include a valid entries array.`
-        },
+        { error: `${providerLabel} CT response did not include a valid entries array.` },
         { status: 502 }
       );
     }
@@ -137,11 +142,11 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({
       start,
       end,
-      provider,
+      provider: resolvedSlug,
       count: entries.length,
       entries
     });
   } catch {
-    return NextResponse.json({ error: `Failed to reach ${providerConfig.label} CT endpoint.` }, { status: 502 });
+    return NextResponse.json({ error: `Failed to reach ${providerLabel} CT endpoint.` }, { status: 502 });
   }
 }

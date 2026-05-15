@@ -1,9 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { parseCtEntry } from "@/lib/ctParser";
+import { resolveAllLogs, type CtLogEntry } from "@/lib/ctLogList";
 
 export const runtime = "nodejs";
-
-type CtProvider = "cloudflare" | "digicert";
 
 type CtEntry = {
   leaf_input: string;
@@ -19,14 +18,8 @@ type CtSthResponse = {
   timestamp?: number;
 };
 
-type ProviderConfig = {
-  label: string;
-  getEntriesEndpoint: string;
-  getSthEndpoint: string;
-};
-
 type SourceSummary = {
-  source: CtProvider;
+  source: string;
   providerLabel: string;
   latestIndex: number;
   treeSize: number;
@@ -36,19 +29,6 @@ type SourceSummary = {
   sthTimestamp: string;
   sthFetchMs: number;
   fetchEntriesMs: number;
-};
-
-const PROVIDER_CONFIG: Record<CtProvider, ProviderConfig> = {
-  cloudflare: {
-    label: "Cloudflare",
-    getEntriesEndpoint: "https://ct.cloudflare.com/logs/nimbus2026/ct/v1/get-entries",
-    getSthEndpoint: "https://ct.cloudflare.com/logs/nimbus2026/ct/v1/get-sth"
-  },
-  digicert: {
-    label: "DigiCert",
-    getEntriesEndpoint: "https://wyvern.ct.digicert.com/2026h1/ct/v1/get-entries",
-    getSthEndpoint: "https://wyvern.ct.digicert.com/2026h1/ct/v1/get-sth"
-  }
 };
 
 const MAX_WINDOW_SIZE = 1024;
@@ -67,27 +47,16 @@ const readLimitParam = (value: string | null): number => {
   return Math.min(parsed, MAX_WINDOW_SIZE);
 };
 
-const readSourcesParam = (value: string | null): CtProvider[] => {
+const readSourcesParam = (value: string | null): string[] | null => {
   if (!value || value.trim().length === 0) {
-    return ["cloudflare", "digicert"];
+    return null;
   }
 
-  const sourceSet = new Set<CtProvider>();
-  value
-    .split(",")
-    .map((item) => item.trim().toLowerCase())
-    .forEach((item) => {
-      if (item === "cloudflare" || item === "digicert") {
-        sourceSet.add(item);
-      }
-    });
+  const slugs = Array.from(
+    new Set(value.split(",").map((item) => item.trim().toLowerCase()).filter((item) => item.length > 0))
+  );
 
-  const sources = Array.from(sourceSet);
-  if (sources.length === 0) {
-    throw new Error("sources must include cloudflare and/or digicert.");
-  }
-
-  return sources;
+  return slugs.length === 0 ? null : slugs;
 };
 
 const writeEvent = <T,>(
@@ -197,10 +166,9 @@ const buildRanges = (start: number, end: number): Array<{ start: number; end: nu
 };
 
 const fetchLatestIndex = async (
-  source: CtProvider
+  config: CtLogEntry
 ): Promise<{ treeSize: number; latestIndex: number; timestamp: number; sthFetchMs: number }> => {
   const started = Date.now();
-  const config = PROVIDER_CONFIG[source];
 
   const response = await fetch(config.getSthEndpoint, {
     headers: {
@@ -212,16 +180,16 @@ const fetchLatestIndex = async (
 
   if (!response.ok) {
     const details = (await response.text()).slice(0, 500);
-    throw new Error(`${config.label} get-sth failed with ${response.status}: ${details}`);
+    throw new Error(`${config.operator} get-sth failed with ${response.status}: ${details}`);
   }
 
   const payload = (await response.json()) as CtSthResponse;
   if (typeof payload.tree_size !== "number" || !Number.isSafeInteger(payload.tree_size) || payload.tree_size <= 0) {
-    throw new Error(`${config.label} get-sth did not return a valid tree_size.`);
+    throw new Error(`${config.operator} get-sth did not return a valid tree_size.`);
   }
 
   if (typeof payload.timestamp !== "number" || !Number.isSafeInteger(payload.timestamp) || payload.timestamp <= 0) {
-    throw new Error(`${config.label} get-sth did not return a valid timestamp.`);
+    throw new Error(`${config.operator} get-sth did not return a valid timestamp.`);
   }
 
   return {
@@ -233,12 +201,11 @@ const fetchLatestIndex = async (
 };
 
 const fetchEntriesRange = async (
-  source: CtProvider,
+  config: CtLogEntry,
   start: number,
   end: number
 ): Promise<{ entries: CtEntry[]; fetchEntriesMs: number }> => {
   const started = Date.now();
-  const config = PROVIDER_CONFIG[source];
   const target = new URL(config.getEntriesEndpoint);
   target.searchParams.set("start", String(start));
   target.searchParams.set("end", String(end));
@@ -253,12 +220,12 @@ const fetchEntriesRange = async (
 
   if (!response.ok) {
     const details = (await response.text()).slice(0, 500);
-    throw new Error(`${config.label} get-entries failed with ${response.status}: ${details}`);
+    throw new Error(`${config.operator} get-entries failed with ${response.status}: ${details}`);
   }
 
   const payload = (await response.json()) as CtEntriesResponse;
   if (!Array.isArray(payload.entries)) {
-    throw new Error(`${config.label} get-entries did not return entries.`);
+    throw new Error(`${config.operator} get-entries did not return entries.`);
   }
 
   const entries = payload.entries.filter(
@@ -273,11 +240,11 @@ const fetchEntriesRange = async (
 };
 
 export async function GET(request: NextRequest) {
-  let sources: CtProvider[];
+  let slugsParam: string[] | null;
   let limit: number;
 
   try {
-    sources = readSourcesParam(request.nextUrl.searchParams.get("sources"));
+    slugsParam = readSourcesParam(request.nextUrl.searchParams.get("sources"));
     limit = readLimitParam(request.nextUrl.searchParams.get("limit"));
   } catch (error) {
     return NextResponse.json(
@@ -309,7 +276,8 @@ export async function GET(request: NextRequest) {
       };
 
       const streamDecodedRange = async (
-        source: CtProvider,
+        source: string,
+        sourceConfig: CtLogEntry,
         providerLabel: string,
         start: number,
         end: number,
@@ -326,7 +294,7 @@ export async function GET(request: NextRequest) {
             break;
           }
 
-          const fetched = await fetchEntriesRange(source, range.start, range.end);
+          const fetched = await fetchEntriesRange(sourceConfig, range.start, range.end);
           fetchEntriesMs += fetched.fetchEntriesMs;
           fetchedCount += fetched.entries.length;
 
@@ -368,6 +336,20 @@ export async function GET(request: NextRequest) {
       };
 
       try {
+        const allLogs = await resolveAllLogs();
+        const logMap = new Map<string, CtLogEntry>(allLogs.map((l) => [l.slug, l]));
+
+        const sources = slugsParam ?? Array.from(logMap.keys());
+
+        const unknownSlugs = sources.filter((s) => !logMap.has(s));
+        if (unknownSlugs.length > 0) {
+          emit("stream_error", {
+            error: `Unknown CT log slug(s): ${unknownSlugs.map((s) => `"${s}"`).join(", ")}. Call /api/ct-log-list for available slugs.`
+          });
+          controller.close();
+          return;
+        }
+
         emit("started", {
           sources,
           limit,
@@ -376,8 +358,8 @@ export async function GET(request: NextRequest) {
         });
 
         const sourceSummaries: SourceSummary[] = [];
-        const treeSizeBySource = new Map<CtProvider, number>();
-        const latestIndexBySource = new Map<CtProvider, number>();
+        const treeSizeBySource = new Map<string, number>();
+        const latestIndexBySource = new Map<string, number>();
         let totalDecodedEntries = 0;
         let totalDecodeErrors = 0;
 
@@ -386,10 +368,10 @@ export async function GET(request: NextRequest) {
             break;
           }
 
-          const config = PROVIDER_CONFIG[source];
+          const config = logMap.get(source)!;
 
           try {
-            const latest = await fetchLatestIndex(source);
+            const latest = await fetchLatestIndex(config);
             const rangeEnd = latest.latestIndex;
             const rangeStart = Math.max(0, rangeEnd - (limit - 1));
             treeSizeBySource.set(source, latest.treeSize);
@@ -397,7 +379,7 @@ export async function GET(request: NextRequest) {
 
             emit("source_meta", {
               source,
-              providerLabel: config.label,
+              providerLabel: config.operator,
               phase: "initial",
               treeSize: latest.treeSize,
               latestIndex: latest.latestIndex,
@@ -407,13 +389,13 @@ export async function GET(request: NextRequest) {
               sthFetchMs: latest.sthFetchMs
             });
 
-            const initialRangeResult = await streamDecodedRange(source, config.label, rangeStart, rangeEnd, "initial");
+            const initialRangeResult = await streamDecodedRange(source, config, config.operator, rangeStart, rangeEnd, "initial");
             totalDecodedEntries += initialRangeResult.decodedCount;
             totalDecodeErrors += initialRangeResult.decodeErrors;
 
             const summary: SourceSummary = {
               source,
-              providerLabel: config.label,
+              providerLabel: config.operator,
               latestIndex: latest.latestIndex,
               treeSize: latest.treeSize,
               rangeStart,
@@ -428,7 +410,7 @@ export async function GET(request: NextRequest) {
 
             emit("range_completed", {
               source,
-              providerLabel: config.label,
+              providerLabel: config.operator,
               phase: "initial",
               start: rangeStart,
               end: rangeEnd,
@@ -440,7 +422,7 @@ export async function GET(request: NextRequest) {
           } catch (sourceError) {
             emit("source_error", {
               source,
-              providerLabel: config.label,
+              providerLabel: config.operator,
               phase: "initial",
               error: "Failed to process source.",
               details: sourceError instanceof Error ? sourceError.message : "Unknown source error."
@@ -472,15 +454,15 @@ export async function GET(request: NextRequest) {
               continue;
             }
 
-            const config = PROVIDER_CONFIG[source];
+            const config = logMap.get(source)!;
 
             try {
-              const latest = await fetchLatestIndex(source);
+              const latest = await fetchLatestIndex(config);
               const diff = latest.treeSize - previousTreeSize;
 
               emit("monitor_tick", {
                 source,
-                providerLabel: config.label,
+                providerLabel: config.operator,
                 checkedAt: new Date().toISOString(),
                 previousTreeSize,
                 currentTreeSize: latest.treeSize,
@@ -495,7 +477,7 @@ export async function GET(request: NextRequest) {
 
                 emit("diff_detected", {
                   source,
-                  providerLabel: config.label,
+                  providerLabel: config.operator,
                   previousTreeSize,
                   currentTreeSize: latest.treeSize,
                   diff,
@@ -503,13 +485,13 @@ export async function GET(request: NextRequest) {
                   end: newEnd
                 });
 
-                const diffRangeResult = await streamDecodedRange(source, config.label, newStart, newEnd, "diff");
+                const diffRangeResult = await streamDecodedRange(source, config, config.operator, newStart, newEnd, "diff");
                 totalDecodedEntries += diffRangeResult.decodedCount;
                 totalDecodeErrors += diffRangeResult.decodeErrors;
 
                 emit("range_completed", {
                   source,
-                  providerLabel: config.label,
+                  providerLabel: config.operator,
                   phase: "diff",
                   start: newStart,
                   end: newEnd,
@@ -521,7 +503,7 @@ export async function GET(request: NextRequest) {
               } else if (diff < 0) {
                 emit("source_warning", {
                   source,
-                  providerLabel: config.label,
+                  providerLabel: config.operator,
                   message:
                     "tree_size moved backwards. local baseline will be reset to current tree_size for continued monitoring.",
                   previousTreeSize,
@@ -534,7 +516,7 @@ export async function GET(request: NextRequest) {
             } catch (sourceError) {
               emit("source_error", {
                 source,
-                providerLabel: config.label,
+                providerLabel: config.operator,
                 phase: "monitor",
                 error: "Failed to monitor source.",
                 details: sourceError instanceof Error ? sourceError.message : "Unknown monitor error."

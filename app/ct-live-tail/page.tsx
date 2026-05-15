@@ -3,17 +3,21 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import styles from "./page.module.css";
 
-type CtProvider = "cloudflare" | "digicert";
+type CtLog = {
+  slug: string;
+  operator: string;
+  description: string;
+};
 
 type StartedEvent = {
-  sources: CtProvider[];
+  sources: string[];
   limit: number;
   monitorIntervalMs: number;
   startedAt: string;
 };
 
 type SourceMetaEvent = {
-  source: CtProvider;
+  source: string;
   providerLabel: string;
   phase: "initial";
   treeSize: number;
@@ -25,14 +29,14 @@ type SourceMetaEvent = {
 };
 
 type EntryEvent = {
-  source: CtProvider;
+  source: string;
   logIndex: number;
   phase: "initial" | "diff";
   line: string;
 };
 
 type RangeCompletedEvent = {
-  source: CtProvider;
+  source: string;
   providerLabel: string;
   phase: "initial" | "diff";
   start: number;
@@ -44,14 +48,14 @@ type RangeCompletedEvent = {
 };
 
 type SourceErrorEvent = {
-  source: CtProvider;
+  source: string;
   providerLabel: string;
   error: string;
   details?: string;
 };
 
 type SourceSummary = {
-  source: CtProvider;
+  source: string;
   providerLabel: string;
   latestIndex: number;
   treeSize: number;
@@ -65,14 +69,14 @@ type SourceSummary = {
 
 type MonitorReadyEvent = {
   monitorIntervalMs: number;
-  trackedSources: CtProvider[];
+  trackedSources: string[];
   sourceSummaries: SourceSummary[];
   totalDecodedEntries: number;
   totalDecodeErrors: number;
 };
 
 type MonitorTickEvent = {
-  source: CtProvider;
+  source: string;
   providerLabel: string;
   checkedAt: string;
   previousTreeSize: number;
@@ -83,7 +87,7 @@ type MonitorTickEvent = {
 };
 
 type DiffDetectedEvent = {
-  source: CtProvider;
+  source: string;
   providerLabel: string;
   previousTreeSize: number;
   currentTreeSize: number;
@@ -93,7 +97,7 @@ type DiffDetectedEvent = {
 };
 
 type SourceWarningEvent = {
-  source: CtProvider;
+  source: string;
   providerLabel: string;
   message: string;
   previousTreeSize: number;
@@ -115,7 +119,6 @@ type StreamErrorEvent = {
   details?: string;
 };
 
-const PROVIDERS: CtProvider[] = ["cloudflare", "digicert"];
 const WINDOW_LIMIT = 1024;
 
 const parseEventData = <T,>(event: Event): T => {
@@ -123,10 +126,11 @@ const parseEventData = <T,>(event: Event): T => {
   return JSON.parse(payload) as T;
 };
 
-const getProviderLabel = (provider: CtProvider): string => (provider === "digicert" ? "DigiCert" : "Cloudflare");
-
 export default function CtLiveTailPage() {
-  const [selectedSources, setSelectedSources] = useState<CtProvider[]>(["cloudflare", "digicert"]);
+  const [availableLogs, setAvailableLogs] = useState<CtLog[]>([]);
+  const [logsLoading, setLogsLoading] = useState(true);
+  const [logsError, setLogsError] = useState<string | null>(null);
+  const [selectedSources, setSelectedSources] = useState<string[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [terminalLines, setTerminalLines] = useState<string[]>([
@@ -165,6 +169,23 @@ export default function CtLiveTailPage() {
   }, []);
 
   useEffect(() => {
+    fetch("/api/ct-log-list")
+      .then((res) => {
+        if (!res.ok) throw new Error(`CT log list request failed with status ${res.status}`);
+        return res.json() as Promise<{ logs: CtLog[] }>;
+      })
+      .then(({ logs }) => {
+        setAvailableLogs(logs);
+        setSelectedSources(logs.map((l) => l.slug));
+        setLogsLoading(false);
+      })
+      .catch((err: unknown) => {
+        setLogsError(err instanceof Error ? err.message : "Failed to load CT log list.");
+        setLogsLoading(false);
+      });
+  }, []);
+
+  useEffect(() => {
     if (terminalBodyRef.current) {
       terminalBodyRef.current.scrollTop = terminalBodyRef.current.scrollHeight;
     }
@@ -172,9 +193,9 @@ export default function CtLiveTailPage() {
 
   const isDisabled = useMemo(() => isRunning || selectedSources.length === 0, [isRunning, selectedSources.length]);
 
-  const toggleSource = (provider: CtProvider) => {
+  const toggleSource = (slug: string) => {
     setSelectedSources((current) =>
-      current.includes(provider) ? current.filter((source) => source !== provider) : [...current, provider]
+      current.includes(slug) ? current.filter((source) => source !== slug) : [...current, slug]
     );
   };
 
@@ -328,18 +349,20 @@ export default function CtLiveTailPage() {
 
       <form className={styles.controls} onSubmit={handleStart}>
         <div className={styles.sourceGrid}>
-          {PROVIDERS.map((provider) => (
+          {logsLoading && <p>Loading CT log sources...</p>}
+          {logsError && <p>Error loading sources: {logsError}</p>}
+          {!logsLoading && !logsError && availableLogs.map((log) => (
             <label
-              key={provider}
-              className={`${styles.sourceOption} ${selectedSources.includes(provider) ? styles.sourceOptionSelected : ""}`}
+              key={log.slug}
+              className={`${styles.sourceOption} ${selectedSources.includes(log.slug) ? styles.sourceOptionSelected : ""}`}
             >
               <input
                 type="checkbox"
-                checked={selectedSources.includes(provider)}
-                onChange={() => toggleSource(provider)}
+                checked={selectedSources.includes(log.slug)}
+                onChange={() => toggleSource(log.slug)}
                 disabled={isRunning}
               />
-              <span>{getProviderLabel(provider)}</span>
+              <span>{log.description}</span>
             </label>
           ))}
         </div>
